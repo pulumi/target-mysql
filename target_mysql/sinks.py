@@ -34,6 +34,10 @@ class MySQLSink(SQLSink):
             **kwargs,
         )
         self.temp_table_name = self.generate_temp_table_name()
+        self._staging_table_name = None
+        self._staging_table = None
+        if self.config.get("truncate", False):
+            self._staging_table_name = f"staging_{self.generate_temp_table_name()}"
 
     @property
     def append_only(self) -> bool:
@@ -73,43 +77,82 @@ class MySQLSink(SQLSink):
         Args:
             context: Stream partition or context dictionary.
         """
-        # First we need to be sure the main table is already created
         table: sqlalchemy.Table = self.connector.prepare_table(
             full_table_name=self.full_table_name,
             schema=self.schema,
             primary_keys=self.key_properties,
             as_temp_table=False,
         )
-        # Create a temp table (Creates from the table above)
-        temp_table: sqlalchemy.Table = self.connector.prepare_table(
-            full_table_name=self.temp_table_name,
-            schema=self.schema,
-            primary_keys=self.key_properties,
-            as_temp_table=True,
-        )
-        # Insert into temp table
-        self.bulk_insert_records(
-            table=temp_table,
-            schema=self.schema,
-            primary_keys=self.key_properties,
-            records=context["records"],
-        )
-        # Merge data from Temp table to main table
-        self.upsert(
-            from_table=temp_table,
-            to_table=table,
-            schema=self.schema,
-            join_keys=self.key_properties,
-        )
-        # Drop temp table
-        self.connector.drop_table(temp_table)
+
+        if self.config.get("truncate", False):
+            if self._staging_table is None:
+                self._staging_table = self.connector.prepare_table(
+                    full_table_name=self._staging_table_name,
+                    schema=self.schema,
+                    primary_keys=self.key_properties,
+                    as_temp_table=True,
+                )
+            self.bulk_insert_records(
+                table=self._staging_table,
+                schema=self.schema,
+                primary_keys=self.key_properties,
+                records=context["records"],
+            )
+        else:
+            temp_table: sqlalchemy.Table = self.connector.prepare_table(
+                full_table_name=self.temp_table_name,
+                schema=self.schema,
+                primary_keys=self.key_properties,
+                as_temp_table=True,
+            )
+            self.bulk_insert_records(
+                table=temp_table,
+                schema=self.schema,
+                primary_keys=self.key_properties,
+                records=context["records"],
+            )
+            self.upsert(
+                from_table=temp_table,
+                to_table=table,
+                schema=self.schema,
+                join_keys=self.key_properties,
+            )
+            self.connector.drop_table(temp_table)
+
+    def clean_up(self) -> None:
+        """Perform final cleanup after all batches are processed.
+
+        If truncate mode is enabled, this method performs the final truncate
+        and insert in a single transaction to ensure atomicity.
+        """
+        if self.config.get("truncate", False) and self._staging_table is not None:
+            self.logger.info("Performing truncate operation in transaction...")
+            table: sqlalchemy.Table = self.connector.prepare_table(
+                full_table_name=self.full_table_name,
+                schema=self.schema,
+                primary_keys=self.key_properties,
+                as_temp_table=False,
+            )
+
+            with self.connector._engine.begin() as conn:
+                conn.execute(sqlalchemy.text(f"DELETE FROM {self.full_table_name}"))
+                select_stmt = select(self._staging_table.columns).select_from(
+                    self._staging_table
+                )
+                insert_stmt = table.insert().from_select(
+                    names=self._staging_table.columns,
+                    select=select_stmt,
+                )
+                conn.execute(insert_stmt)
+                self.logger.info("Truncate and insert completed successfully")
+
+            self.connector.drop_table(self._staging_table)
+            self._staging_table = None
+
+        super().clean_up()
 
     def generate_temp_table_name(self) -> str:
         """Uuid temp table name."""
-        # 'temp_test_optional_attributes_388470e9_fbd0_47b7_a52f_d32a2ee3f5f6'
-        # exceeds maximum length of 63 characters
-        # Is hit if we have a long table name, there is no limit on Temporary tables
-        # in MySQL, used a guid just in case we are using the same session
         return f"{str(uuid.uuid4()).replace('-','_')}"
 
     def bulk_insert_records(
@@ -219,14 +262,37 @@ class MySQLSink(SQLSink):
             report number of records affected/inserted.
 
         """
+        self._perform_upsert(from_table, to_table, schema, join_keys, self.connection)
+
+    def _perform_upsert(
+        self,
+        from_table: sqlalchemy.Table,
+        to_table: sqlalchemy.Table,
+        schema: dict,  # noqa: ARG002
+        join_keys: list[Column],
+        connection: sqlalchemy.engine.Connection,
+    ) -> int | None:
+        """Perform the actual upsert operation using the provided connection.
+
+        Args:
+            from_table: The source table name.
+            to_table: The destination table name.
+            join_keys: The merge upsert keys, or `None` to append.
+            schema: Singer Schema message.
+            connection: The database connection to use for executing statements.
+
+        Return:
+            The number of records copied, if detectable, or `None` if the API does not
+            report number of records affected/inserted.
+
+        """
         if self.append_only is True:
-            # Insert
             select_stmt = select(from_table.columns).select_from(from_table)
             insert_stmt = to_table.insert().from_select(
                 names=from_table.columns,
                 select=select_stmt,
             )
-            self.connection.execute(insert_stmt)
+            connection.execute(insert_stmt)
         else:
             join_predicates = []
             for key in join_keys:
@@ -251,9 +317,8 @@ class MySQLSink(SQLSink):
                 names=from_table.columns,
                 select=select_stmt,
             )
-            self.connection.execute(insert_stmt)
+            connection.execute(insert_stmt)
 
-            # Update
             where_condition = join_condition
             update_columns = {}
             for column_name in self.schema["properties"]:
@@ -262,7 +327,7 @@ class MySQLSink(SQLSink):
                 update_columns[to_table_column] = from_table_column
 
             update_stmt = update(to_table).where(where_condition).values(update_columns)
-            self.connection.execute(update_stmt)
+            connection.execute(update_stmt)
 
     def column_representation(
         self,
@@ -343,8 +408,6 @@ class MySQLSink(SQLSink):
         Args:
             new_version: The version number to activate.
         """
-        # There's nothing to do if the table doesn't exist yet
-        # (which it won't the first time the stream is processed)
         if not self.connector.table_exists(self.full_table_name):
             return
 
@@ -371,12 +434,15 @@ class MySQLSink(SQLSink):
 
         self.logger.info("Hard delete: %s", self.config.get("hard_delete"))
         if self.config["hard_delete"] is True:
-            self.connection.execute(
-                # TODO: query injection?
-                f"DELETE FROM {self.full_table_name} "  # noqa: S608
-                f"WHERE {self.version_column_name} <= {new_version} "
+            query = sqlalchemy.text(
+                f"DELETE FROM {self.full_table_name} "
+                f"WHERE {self.version_column_name} <= :version "
                 f"OR {self.version_column_name} IS NULL",
             )
+            query = query.bindparams(
+                bindparam("version", value=new_version, type_=integer_type),
+            )
+            self.connection.execute(query)
             return
 
         if not self.connector.column_exists(
@@ -388,7 +454,6 @@ class MySQLSink(SQLSink):
                 self.soft_delete_column_name,
                 sql_type=datetime_type,
             )
-        # Need to deal with the case where data doesn't exist for the version column
         query = sqlalchemy.text(
             f"UPDATE {self.full_table_name}\n"
             f"SET {self.soft_delete_column_name} = :deletedate \n"

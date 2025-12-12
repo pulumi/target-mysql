@@ -152,6 +152,16 @@ class TargetMySQL(Target):
                 "bytes."
             ),
         ),
+        th.Property(
+            "truncate",
+            th.BooleanType,
+            default=False,
+            description=(
+                "If true, delete all existing data from the table before loading new data. "
+                "This happens once at the start of the first batch and is performed in the "
+                "same transaction as the insert to avoid users seeing an empty table."
+            ),
+        ),
     ).to_dict()
     default_sink_class = MySQLSink
 
@@ -171,7 +181,7 @@ class TargetMySQL(Target):
         """Process a RECORD message.
 
         Args:
-            message_dict: TODO
+            message_dict: The RECORD message dictionary.
         """
         stream_name = message_dict["stream"]
         if self.mapper.stream_maps.get(stream_name) is None:
